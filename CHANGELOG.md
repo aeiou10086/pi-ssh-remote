@@ -16,7 +16,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Rel
 
 ### Fixed
 
-- None.
+- Made remote commands honor the tool-call abort signal — both `remote`'s `exec` action and the shell tool routed to the remote — so a caller's stop request returns immediately instead of hanging until the command finishes.
 
 ## [0.1.15] - 2026-10-11
 

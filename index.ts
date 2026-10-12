@@ -747,9 +747,11 @@ function execRemoteLimited(
   timeoutSeconds: number,
   maxLines: number,
   maxBytes: number,
+  signal?: AbortSignal,
 ): Promise<ReturnType<RemoteExecAccumulator["finish"]>> {
   const resolvedTimeout = parseRemoteTimeout(timeoutSeconds);
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error("aborted"));
     client.exec(withRemoteTimeout(command, resolvedTimeout), (error, stream) => {
       if (error) return reject(error);
       const accumulator = new RemoteExecAccumulator(maxLines, maxBytes);
@@ -759,7 +761,20 @@ function execRemoteLimited(
         locallyTimedOut = true;
         stream.close();
       }, (resolvedTimeout + 8) * 1000);
-      const cleanup = () => clearTimeout(timer);
+      // `close()` is only a graceful request: while a long remote command is still
+      // running it may never surface as a "close" event, so settle here rather than
+      // waiting for one. Otherwise the tool call never returns and the caller's
+      // abort (e.g. pi-web's Stop button) is left hanging with it.
+      const abort = () => {
+        try { stream.close(); } catch { /* channel may already be gone */ }
+        try { (stream as { destroy?: () => void }).destroy?.(); } catch { /* ditto */ }
+        fail(new Error("aborted"));
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+      };
       const fail = (failure: Error) => {
         if (settled) return;
         settled = true;
@@ -773,6 +788,10 @@ function execRemoteLimited(
       stream.on("close", (code: number | null) => {
         if (settled) return;
         cleanup();
+        if (signal?.aborted) {
+          fail(new Error("aborted"));
+          return;
+        }
         if (locallyTimedOut || code === 124 || code === 137) {
           fail(new Error(`Remote command timed out after ${resolvedTimeout} seconds`));
           return;
@@ -1353,12 +1372,27 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       const full = `cd -- ${quote(mapPath(cwd))} && ${remoteCommand}`;
       void openExecChannel(full).then((stream) => {
         let timedOut = false;
+        let settled = false;
         const timer = setTimeout(() => { timedOut = true; stream.close(); }, (timeoutSeconds + 8) * 1000);
-        const abort = () => stream.close();
+        // `close()` is only a graceful request: while a long remote command is still
+        // running it may never surface as a "close" event, so settle here rather than
+        // waiting for one. Otherwise the shell tool never returns and a caller's stop
+        // request is left hanging until the command finishes.
+        const abort = () => {
+          try { stream.close(); } catch { /* channel may already be gone */ }
+          try { (stream as { destroy?: () => void }).destroy?.(); } catch { /* ditto */ }
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          reject(new Error("aborted"));
+        };
         signal?.addEventListener("abort", abort, { once: true });
         stream.on("data", onData);
         stream.stderr.on("data", onData);
         stream.on("close", (code: number | null) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
           signal?.removeEventListener("abort", abort);
           if (signal?.aborted) reject(new Error("aborted"));
@@ -1434,7 +1468,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       timeout: Type.Optional(Type.Number({ minimum: 1, maximum: MAX_REMOTE_TIMEOUT_SECONDS, description: `Remote command timeout in seconds; defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS}` })),
       displayLines: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_DISPLAY_LINES, description: "Collapsed visual lines for exec output; defaults to the /remote config display-lines setting (5 initially), maximum 50" })),
     }),
-    async execute(_id, params, _signal, _update, ctx) {
+    async execute(_id, params, signal, _update, ctx) {
       if (params.action === "status") {
         const mappings = [...forwardServers.keys()].sort((a, b) => a - b);
         const text = `${remote ? `Connected: ${endpointDisplayLabel(remote, remote.cwd)}; tool routing: ${routeRemoteTools ? "remote" : "local"}` : "SSH remote is disconnected"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}`;
@@ -1521,6 +1555,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           timeoutSeconds,
           limits.execMaxLines,
           limits.execMaxBytes,
+          signal,
         ));
         return limitRemoteToolResult({
           content: [{ type: "text", text: formatted.text }],
