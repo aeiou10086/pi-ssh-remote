@@ -741,7 +741,79 @@ function execRemote(
   });
 }
 
-function execRemoteLimited(
+const abortedError = (): Error => new Error("aborted");
+
+// Rejects as soon as `signal` aborts, even if `promise` is still pending.
+function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortedError());
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(abortedError());
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", abort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", abort); reject(error); },
+    );
+  });
+}
+
+// Opens an exec channel; a channel that arrives after an abort is closed instead of returned.
+function openAbortableExec(client: SshClient, command: string, signal?: AbortSignal): Promise<ClientChannel> {
+  if (signal?.aborted) return Promise.reject(abortedError());
+  return untilAborted(new Promise<ClientChannel>((resolve, reject) =>
+    client.exec(command, (error, stream) => {
+      if (error) return reject(error);
+      if (signal?.aborted) {
+        try { stream.close(); } catch { /* channel may already be gone */ }
+        return reject(abortedError());
+      }
+      resolve(stream);
+    })), signal);
+}
+
+// Waits for an exec channel to finish. On abort the channel is closed and the call
+// settles immediately: `close()` is only a graceful request, and while a long remote
+// command is still running the "close" event may never arrive, which would leave the
+// tool call (and the caller's stop request) hanging. Remote processes without a pty
+// are not signalled by closing the channel; they stop at their own remote timeout.
+function runExecChannel(
+  stream: ClientChannel,
+  timeoutSeconds: number,
+  onStdout: (chunk: Buffer) => void,
+  onStderr: (chunk: Buffer) => void,
+  signal?: AbortSignal,
+): Promise<{ code: number | null; timedOut: boolean }> {
+  return new Promise((resolve, reject) => {
+    let timedOut = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stream.close();
+    }, (timeoutSeconds + 8) * 1000);
+    const settle = (finish: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      stream.off("data", onStdout);
+      stream.stderr.off("data", onStderr);
+      finish();
+    };
+    const abort = () => {
+      try { stream.close(); } catch { /* channel may already be gone */ }
+      settle(() => reject(abortedError()));
+    };
+    stream.on("data", onStdout);
+    stream.stderr.on("data", onStderr);
+    stream.once("error", (error: Error) => settle(() => reject(error)));
+    stream.on("close", (code: number | null) => settle(() =>
+      signal?.aborted ? reject(abortedError()) : resolve({ code, timedOut })));
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+async function execRemoteLimited(
   client: SshClient,
   command: string,
   timeoutSeconds: number,
@@ -750,61 +822,32 @@ function execRemoteLimited(
   signal?: AbortSignal,
 ): Promise<ReturnType<RemoteExecAccumulator["finish"]>> {
   const resolvedTimeout = parseRemoteTimeout(timeoutSeconds);
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(new Error("aborted"));
-    client.exec(withRemoteTimeout(command, resolvedTimeout), (error, stream) => {
-      if (error) return reject(error);
-      const accumulator = new RemoteExecAccumulator(maxLines, maxBytes);
-      let locallyTimedOut = false;
-      let settled = false;
-      const timer = setTimeout(() => {
-        locallyTimedOut = true;
-        stream.close();
-      }, (resolvedTimeout + 8) * 1000);
-      // `close()` is only a graceful request: while a long remote command is still
-      // running it may never surface as a "close" event, so settle here rather than
-      // waiting for one. Otherwise the tool call never returns and the caller's
-      // abort (e.g. pi-web's Stop button) is left hanging with it.
-      const abort = () => {
-        try { stream.close(); } catch { /* channel may already be gone */ }
-        try { (stream as { destroy?: () => void }).destroy?.(); } catch { /* ditto */ }
-        fail(new Error("aborted"));
-      };
-      signal?.addEventListener("abort", abort, { once: true });
-      const cleanup = () => {
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", abort);
-      };
-      const fail = (failure: Error) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        accumulator.close();
-        reject(failure);
-      };
-      stream.on("data", (chunk: Buffer) => accumulator.append(chunk));
-      stream.stderr.on("data", (chunk: Buffer) => accumulator.appendStderr(chunk));
-      stream.once("error", (streamError: Error) => fail(streamError));
-      stream.on("close", (code: number | null) => {
-        if (settled) return;
-        cleanup();
-        if (signal?.aborted) {
-          fail(new Error("aborted"));
-          return;
-        }
-        if (locallyTimedOut || code === 124 || code === 137) {
-          fail(new Error(`Remote command timed out after ${resolvedTimeout} seconds`));
-          return;
-        }
-        if (code !== 0) {
-          fail(new Error(accumulator.errorMessage() || `Remote command exited with code ${code}`));
-          return;
-        }
-        settled = true;
-        resolve(accumulator.finish());
-      });
-    });
-  });
+  const stream = await openAbortableExec(client, withRemoteTimeout(command, resolvedTimeout), signal);
+  const accumulator = new RemoteExecAccumulator(maxLines, maxBytes);
+  let result: { code: number | null; timedOut: boolean };
+  try {
+    result = await runExecChannel(
+      stream,
+      resolvedTimeout,
+      (chunk) => accumulator.append(chunk),
+      (chunk) => accumulator.appendStderr(chunk),
+      signal,
+    );
+  } catch (error) {
+    accumulator.close();
+    throw error;
+  }
+  const { code, timedOut } = result;
+  if (timedOut || code === 124 || code === 137) {
+    accumulator.close();
+    throw new Error(`Remote command timed out after ${resolvedTimeout} seconds`);
+  }
+  if (code !== 0) {
+    const message = accumulator.errorMessage() || `Remote command exited with code ${code}`;
+    accumulator.close();
+    throw new Error(message);
+  }
+  return accumulator.finish();
 }
 
 function getSftp(client: SshClient): Promise<SFTPWrapper> {
@@ -1129,12 +1172,13 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return reconnectPromise;
   }
 
-  const withReconnect = async <T>(operation: (client: SshClient) => Promise<T>): Promise<T> => {
+  const withReconnect = async <T>(operation: (client: SshClient) => Promise<T>, signal?: AbortSignal): Promise<T> => {
     if (!remote) throw new Error("SSH remote is not connected");
+    if (signal?.aborted) throw abortedError();
     try { return await operation(remote.client); }
     catch (error) {
-      if (!isReconnectable(error)) throw error;
-      const state = await reconnectRemote();
+      if (signal?.aborted || !isReconnectable(error)) throw error;
+      const state = await untilAborted(reconnectRemote(), signal);
       return operation(state.client);
     }
   };
@@ -1361,46 +1405,16 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return { readFile: read.readFile, access: read.access, writeFile: write.writeFile };
   };
 
-  const openExecChannel = async (command: string): Promise<ClientChannel> =>
-    withReconnect((client) => new Promise<ClientChannel>((resolve, reject) =>
-      client.exec(command, (error, stream) => error ? reject(error) : resolve(stream))));
-
   const remoteBashOps = (): BashOperations => ({
-    exec: (command, cwd, { onData, signal, timeout }) => new Promise((resolve, reject) => {
+    exec: async (command, cwd, { onData, signal, timeout }) => {
       const timeoutSeconds = parseRemoteTimeout(timeout ?? DEFAULT_REMOTE_TIMEOUT_SECONDS);
       const remoteCommand = withRemoteTimeout(command, timeoutSeconds);
       const full = `cd -- ${quote(mapPath(cwd))} && ${remoteCommand}`;
-      void openExecChannel(full).then((stream) => {
-        let timedOut = false;
-        let settled = false;
-        const timer = setTimeout(() => { timedOut = true; stream.close(); }, (timeoutSeconds + 8) * 1000);
-        // `close()` is only a graceful request: while a long remote command is still
-        // running it may never surface as a "close" event, so settle here rather than
-        // waiting for one. Otherwise the shell tool never returns and a caller's stop
-        // request is left hanging until the command finishes.
-        const abort = () => {
-          try { stream.close(); } catch { /* channel may already be gone */ }
-          try { (stream as { destroy?: () => void }).destroy?.(); } catch { /* ditto */ }
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", abort);
-          reject(new Error("aborted"));
-        };
-        signal?.addEventListener("abort", abort, { once: true });
-        stream.on("data", onData);
-        stream.stderr.on("data", onData);
-        stream.on("close", (code: number | null) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", abort);
-          if (signal?.aborted) reject(new Error("aborted"));
-          else if (timedOut || code === 124 || code === 137) reject(new Error(`timeout:${timeoutSeconds}`));
-          else resolve({ exitCode: code });
-        });
-      }, reject);
-    }),
+      const stream = await withReconnect((client) => openAbortableExec(client, full, signal), signal);
+      const { code, timedOut } = await runExecChannel(stream, timeoutSeconds, onData, onData, signal);
+      if (timedOut || code === 124 || code === 137) throw new Error(`timeout:${timeoutSeconds}`);
+      return { exitCode: code };
+    },
   });
 
   const localRead = createReadTool(localCwd);
@@ -1539,7 +1553,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         };
       }
       if (params.action === "exec") {
-        const state = await ensureConnected(ctx);
+        const state = await untilAborted(ensureConnected(ctx), signal);
         if (!params.remoteCommand) throw new Error("remoteCommand is required for exec");
         const cdTarget = params.cwd === undefined ? standaloneCdTarget(params.remoteCommand) : undefined;
         if (cdTarget !== undefined) {
@@ -1556,7 +1570,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           limits.execMaxLines,
           limits.execMaxBytes,
           signal,
-        ));
+        ), signal);
         return limitRemoteToolResult({
           content: [{ type: "text", text: formatted.text }],
           details: {
